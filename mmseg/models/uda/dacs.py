@@ -1,6 +1,7 @@
 # The ema model and the domain-mixing are based on:
 # https://github.com/vikolss/DACS
 
+import atexit
 import math
 import os
 import random
@@ -9,6 +10,7 @@ from copy import deepcopy
 import mmcv
 import numpy as np
 import torch
+import torch.nn.functional as F
 from matplotlib import pyplot as plt
 from timm.models.layers import DropPath
 from torch.nn.modules.dropout import _DropoutNd
@@ -202,15 +204,18 @@ class DACS(UDADecorator):
         batch_size = img.shape[0]
         dev = img.device
 
+        
         # Init/update ema model
         if self.local_iter == 0:
             self._init_ema_weights()
             # assert _params_equal(self.get_ema_model(), self.get_model())
 
+        """
         if self.local_iter > 0:
             self._update_ema(self.local_iter)
             # assert not _params_equal(self.get_ema_model(), self.get_model())
             # assert self.get_ema_model().training
+        """
 
         means, stds = get_mean_std(img_metas, dev)
         strong_parameters = {
@@ -253,6 +258,7 @@ class DACS(UDADecorator):
                 grad_mag = calc_grad_magnitude(fd_grads)
                 mmcv.print_log(f'Fdist Grad.: {grad_mag}', 'mmseg')
 
+        """
         # Generate pseudo-label
         for m in self.get_ema_model().modules():
             if isinstance(m, _DropoutNd):
@@ -269,6 +275,59 @@ class DACS(UDADecorator):
         pseudo_weight = torch.sum(ps_large_p).item() / ps_size
         pseudo_weight = pseudo_weight * torch.ones(
             pseudo_prob.shape, device=dev)
+        """
+
+        # get pseudo weights
+        for m in self.get_ema_model().modules():
+            if isinstance(m, _DropoutNd):
+                m.training = False
+            if isinstance(m, DropPath):
+                m.training = False
+        # get t-1 predictions
+        ema_logits = self.get_ema_model().encode_decode(
+            target_img, target_img_metas)
+        # get t predictions
+        for m in self.get_model().modules():
+            if isinstance(m, _DropoutNd):
+                m.training = False
+            if isinstance(m, DropPath):
+                m.training = False
+        student_logits = self.get_model().encode_decode(
+            target_img,
+            target_img_metas)
+
+        # consistency loss from ROCL using cross entropy
+        # have to do it manually as cross entropy support probabilities for each class
+        # is only supported from torch v1.10 onwards
+        denominator = student_logits.clone().detach()
+        denominator = torch.exp(denominator)
+        denominator = denominator.sum(axis=1, keepdim=True)
+
+        consistency_loss = student_logits.clone().detach()
+        consistency_loss = - torch.log(torch.exp(consistency_loss) / denominator) * ema_logits
+        consistency_loss = consistency_loss.sum(axis=1)
+        
+        # convert consistency loss to pseudo weights
+        pseudo_weight = consistency_loss.clone().detach()
+        pseudo_weight.detach().cpu().apply_(lambda x: 1/np.exp(abs(x)))
+        pseudo_weight = pseudo_weight * torch.ones_like(pseudo_weight, device=dev)
+
+        # get pseudo labels
+        if self.local_iter > 0:
+            self._update_ema(self.local_iter)
+
+        ema_logits = self.get_ema_model().encode_decode(
+            target_img, target_img_metas)
+
+        ema_softmax = torch.softmax(ema_logits.detach(), dim=1)
+        _, pseudo_label = torch.max(ema_softmax, dim=1)
+
+        # clean up
+        for m in self.get_model().modules():
+            if isinstance(m, _DropoutNd):
+                m.training = True
+            if isinstance(m, DropPath):
+                m.training = True
 
         if self.psweight_ignore_top > 0:
             # Don't trust pseudo-labels in regions with potential
