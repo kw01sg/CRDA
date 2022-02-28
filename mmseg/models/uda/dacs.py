@@ -263,12 +263,7 @@ class DACS(UDADecorator):
             target_img, target_img_metas)
 
         ema_softmax = torch.softmax(ema_logits.detach(), dim=1)
-        pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
-        ps_large_p = pseudo_prob.ge(self.pseudo_threshold).long() == 1
-        ps_size = np.size(np.array(pseudo_label.cpu()))
-        pseudo_weight = torch.sum(ps_large_p).item() / ps_size
-        pseudo_weight = pseudo_weight * torch.ones(
-            pseudo_prob.shape, device=dev)
+        pseudo_weight, pseudo_label = torch.max(ema_softmax, dim=1)
 
         if self.psweight_ignore_top > 0:
             # Don't trust pseudo-labels in regions with potential
