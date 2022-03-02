@@ -270,6 +270,13 @@ class DACS(UDADecorator):
         pseudo_weight = pseudo_weight * torch.ones(
             pseudo_prob.shape, device=dev)
 
+        # calculate mean and std dev of psuedo weights before processing
+        std, mean = torch.std_mean(pseudo_weight)
+        raw_pseudo_weights_dict = {"raw_pseudo_weights_std": std.item(),
+                                   "raw_pseudo_weights_mean": mean.item()}
+        raw_pseudo_weights_dict = add_prefix(raw_pseudo_weights_dict, 'pseudo')
+        log_vars.update(raw_pseudo_weights_dict)
+
         if self.psweight_ignore_top > 0:
             # Don't trust pseudo-labels in regions with potential
             # rectification artifacts. This can lead to a pseudo-label
@@ -294,6 +301,18 @@ class DACS(UDADecorator):
                 target=torch.stack((gt_pixel_weight[i], pseudo_weight[i])))
         mixed_img = torch.cat(mixed_img)
         mixed_lbl = torch.cat(mixed_lbl)
+
+        # calculate mean and std dev of psuedo weights after mixing
+        # remove zeroes (from ignore_top and ignore_bottom) and ones (from mixing)
+        processed_pseudo_weights = pseudo_weight.clone().flatten()
+        processed_pseudo_weights = processed_pseudo_weights[(processed_pseudo_weights != 0)
+                                                            & (processed_pseudo_weights != 1)]
+        std, mean = torch.std_mean(processed_pseudo_weights)
+        processed_pseudo_weights_dict = {"processed_pseudo_weights_std": std.item(),
+                                         "processed_pseudo_weights_mean": mean.item()}
+        processed_pseudo_weights_dict = add_prefix(processed_pseudo_weights_dict,
+                                                   'pseudo')
+        log_vars.update(processed_pseudo_weights_dict)
 
         # Train on mixed images
         mix_losses = self.get_model().forward_train(
