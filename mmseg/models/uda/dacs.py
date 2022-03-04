@@ -263,12 +263,30 @@ class DACS(UDADecorator):
             target_img, target_img_metas)
 
         ema_softmax = torch.softmax(ema_logits.detach(), dim=1)
-        pseudo_weight, pseudo_label = torch.max(ema_softmax, dim=1)
+        pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
+        ps_large_p = pseudo_prob.ge(self.pseudo_threshold).long() == 1
+        ps_size = np.size(np.array(pseudo_label.cpu()))
+        ps_large_p_ratio = torch.sum(ps_large_p).item() / ps_size
+        pseudo_weight = ps_large_p_ratio * torch.ones(pseudo_prob.shape,
+                                                      device=dev)
 
-        # calculate mean and std dev of psuedo weights before processing
+        # update pseudo weight with ratio of pixels exceeding threshold * pseudo_prob
+        pseudo_weight = pseudo_weight * pseudo_prob
+
+        # log pseudo weight statistics
+        ps_large_p_ratio_dict = {"ps_large_p_ratio": ps_large_p_ratio}
+        ps_large_p_ratio_dict = add_prefix(ps_large_p_ratio_dict, 'pseudo')
+        log_vars.update(ps_large_p_ratio_dict)
+
+        std, mean = torch.std_mean(pseudo_prob)
+        pseudo_prob_dict = {"pseudo_prob_mean": mean.item(),
+                            "pseudo_prob_std": std.item()}
+        pseudo_prob_dict = add_prefix(pseudo_prob_dict, 'pseudo')
+        log_vars.update(pseudo_prob_dict)
+
         std, mean = torch.std_mean(pseudo_weight)
-        raw_pseudo_weights_dict = {"raw_pseudo_weights_std": std.item(),
-                                   "raw_pseudo_weights_mean": mean.item()}
+        raw_pseudo_weights_dict = {"raw_pseudo_weights_mean": mean.item(),
+                                   "raw_pseudo_weights_std": std.item()}
         raw_pseudo_weights_dict = add_prefix(raw_pseudo_weights_dict, 'pseudo')
         log_vars.update(raw_pseudo_weights_dict)
 
@@ -303,8 +321,8 @@ class DACS(UDADecorator):
         processed_pseudo_weights = processed_pseudo_weights[(processed_pseudo_weights != 0)
                                                             & (processed_pseudo_weights != 1)]
         std, mean = torch.std_mean(processed_pseudo_weights)
-        processed_pseudo_weights_dict = {"processed_pseudo_weights_std": std.item(),
-                                         "processed_pseudo_weights_mean": mean.item()}
+        processed_pseudo_weights_dict = {"processed_pseudo_weights_mean": mean.item(),
+                                         "processed_pseudo_weights_std": std.item()}
         processed_pseudo_weights_dict = add_prefix(processed_pseudo_weights_dict,
                                                    'pseudo')
         log_vars.update(processed_pseudo_weights_dict)
