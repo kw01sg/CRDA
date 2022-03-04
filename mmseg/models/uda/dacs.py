@@ -258,25 +258,6 @@ class DACS(UDADecorator):
                 grad_mag = calc_grad_magnitude(fd_grads)
                 mmcv.print_log(f'Fdist Grad.: {grad_mag}', 'mmseg')
 
-        """
-        # Generate pseudo-label
-        for m in self.get_ema_model().modules():
-            if isinstance(m, _DropoutNd):
-                m.training = False
-            if isinstance(m, DropPath):
-                m.training = False
-        ema_logits = self.get_ema_model().encode_decode(
-            target_img, target_img_metas)
-
-        ema_softmax = torch.softmax(ema_logits.detach(), dim=1)
-        pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
-        ps_large_p = pseudo_prob.ge(self.pseudo_threshold).long() == 1
-        ps_size = np.size(np.array(pseudo_label.cpu()))
-        pseudo_weight = torch.sum(ps_large_p).item() / ps_size
-        pseudo_weight = pseudo_weight * torch.ones(
-            pseudo_prob.shape, device=dev)
-        """
-
         # get pseudo weights
         for m in self.get_ema_model().modules():
             if isinstance(m, _DropoutNd):
@@ -308,9 +289,16 @@ class DACS(UDADecorator):
         consistency_loss = consistency_loss.sum(axis=1)
         
         # convert consistency loss to pseudo weights
-        pseudo_weight = consistency_loss.clone().detach()
-        pseudo_weight.detach().cpu().apply_(lambda x: 1/np.exp(abs(x)))
-        pseudo_weight = pseudo_weight * torch.ones_like(pseudo_weight, device=dev)
+        consistency_weight = consistency_loss.clone().detach()
+        consistency_weight.detach().cpu().apply_(lambda x: 1/np.exp(abs(x)))
+        consistency_weight = consistency_weight * torch.ones_like(consistency_weight, device=dev)
+
+        # clean up
+        for m in self.get_model().modules():
+            if isinstance(m, _DropoutNd):
+                m.training = True
+            if isinstance(m, DropPath):
+                m.training = True
 
         # get pseudo labels
         if self.local_iter > 0:
@@ -320,14 +308,32 @@ class DACS(UDADecorator):
             target_img, target_img_metas)
 
         ema_softmax = torch.softmax(ema_logits.detach(), dim=1)
-        _, pseudo_label = torch.max(ema_softmax, dim=1)
+        pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
+        ps_large_p = pseudo_prob.ge(self.pseudo_threshold).long() == 1
+        ps_size = np.size(np.array(pseudo_label.cpu()))
+        ps_large_p_ratio = torch.sum(ps_large_p).item() / ps_size
+        pseudo_weight = ps_large_p_ratio * torch.ones(pseudo_prob.shape,
+                                                      device=dev)
 
-        # clean up
-        for m in self.get_model().modules():
-            if isinstance(m, _DropoutNd):
-                m.training = True
-            if isinstance(m, DropPath):
-                m.training = True
+        # update pseudo weight with ratio of pixels exceeding threshold * pseudo_prob
+        pseudo_weight = pseudo_weight * consistency_weight
+
+        # log pseudo weight statistics
+        ps_large_p_ratio_dict = {"ps_large_p_ratio": ps_large_p_ratio}
+        ps_large_p_ratio_dict = add_prefix(ps_large_p_ratio_dict, 'pseudo')
+        log_vars.update(ps_large_p_ratio_dict)
+
+        std, mean = torch.std_mean(consistency_weight)
+        consistency_weight_dict = {"consistency_weight_mean": mean.item(),
+                                   "consistency_weight_std": std.item()}
+        consistency_weight_dict = add_prefix(consistency_weight_dict, 'pseudo')
+        log_vars.update(consistency_weight_dict)
+
+        std, mean = torch.std_mean(pseudo_weight)
+        raw_pseudo_weights_dict = {"raw_pseudo_weights_mean": mean.item(),
+                                   "raw_pseudo_weights_std": std.item()}
+        raw_pseudo_weights_dict = add_prefix(raw_pseudo_weights_dict, 'pseudo')
+        log_vars.update(raw_pseudo_weights_dict)
 
         if self.psweight_ignore_top > 0:
             # Don't trust pseudo-labels in regions with potential
@@ -353,6 +359,18 @@ class DACS(UDADecorator):
                 target=torch.stack((gt_pixel_weight[i], pseudo_weight[i])))
         mixed_img = torch.cat(mixed_img)
         mixed_lbl = torch.cat(mixed_lbl)
+
+        # calculate mean and std dev of psuedo weights after mixing
+        # remove zeroes (from ignore_top and ignore_bottom) and ones (from mixing)
+        processed_pseudo_weights = pseudo_weight.clone().flatten()
+        processed_pseudo_weights = processed_pseudo_weights[(processed_pseudo_weights != 0)
+                                                            & (processed_pseudo_weights != 1)]
+        std, mean = torch.std_mean(processed_pseudo_weights)
+        processed_pseudo_weights_dict = {"processed_pseudo_weights_mean": mean.item(),
+                                         "processed_pseudo_weights_std": std.item()}
+        processed_pseudo_weights_dict = add_prefix(processed_pseudo_weights_dict,
+                                                   'pseudo')
+        log_vars.update(processed_pseudo_weights_dict)
 
         # Train on mixed images
         mix_losses = self.get_model().forward_train(
