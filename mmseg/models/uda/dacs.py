@@ -45,6 +45,31 @@ def calc_grad_magnitude(grads, norm_type=2.0):
     return norm
 
 
+def calc_consistency_loss(student_softmax, teacher_softmax):
+    # consistency loss from ROCL using cross entropy
+    # have to do it manually as cross entropy loss calculating probabilities
+    # for each class is only supported from torch v1.10 onwards
+    denominator = student_softmax.clone()
+    denominator = torch.exp(denominator)
+    denominator = denominator.sum(axis=1, keepdim=True)
+
+    consistency_loss = student_softmax.clone()
+    consistency_loss = - torch.log(torch.exp(consistency_loss)
+                                   / denominator) * teacher_softmax
+    consistency_loss = consistency_loss.sum(axis=1)
+
+    return consistency_loss
+
+
+def consistency_loss_to_weights(consistency_loss, dev):
+    consistency_weight = consistency_loss.clone().detach().cpu()
+    consistency_weight.apply_(lambda x: 1/np.exp(abs(x)))
+    consistency_weight = consistency_weight.to(device=dev)
+    consistency_weight = consistency_weight * torch.ones_like(consistency_weight,
+                                                              device=dev)
+    return consistency_weight
+
+
 @UDA.register_module()
 class DACS(UDADecorator):
 
@@ -295,16 +320,7 @@ class DACS(UDADecorator):
         log_vars.update(student_softmax_dict)
         """
 
-        # consistency loss from ROCL using cross entropy
-        # have to do it manually as cross entropy loss calculating probabilities
-        # for each class is only supported from torch v1.10 onwards
-        denominator = student_softmax.clone()
-        denominator = torch.exp(denominator)
-        denominator = denominator.sum(axis=1, keepdim=True)
-
-        consistency_loss = student_softmax.clone()
-        consistency_loss = - torch.log(torch.exp(consistency_loss) / denominator) * ema_softmax
-        consistency_loss = consistency_loss.sum(axis=1)
+        consistency_loss = calc_consistency_loss(student_softmax, ema_softmax)
 
         std, mean = torch.std_mean(consistency_loss)
         consistency_loss_dict = {"consistency_loss_mean": mean.item(),
@@ -313,11 +329,7 @@ class DACS(UDADecorator):
         log_vars.update(consistency_loss_dict)
 
         # convert consistency loss to pseudo weights
-        consistency_weight = consistency_loss.clone().detach()
-        consistency_weight = consistency_weight.detach().cpu()
-        consistency_weight.apply_(lambda x: 1/np.exp(abs(x)))
-        consistency_weight = consistency_weight.to(device=dev)
-        consistency_weight = consistency_weight * torch.ones_like(consistency_weight, device=dev)
+        consistency_weight = consistency_loss_to_weights(consistency_loss, dev)
 
         std, mean = torch.std_mean(consistency_weight)
         consistency_weight_dict = {"consistency_weight_mean": mean.item(),
@@ -362,16 +374,47 @@ class DACS(UDADecorator):
         ps_large_p = pseudo_prob.ge(self.pseudo_threshold).long() == 1
         ps_size = np.size(np.array(pseudo_label.cpu()))
         ps_large_p_ratio = torch.sum(ps_large_p).item() / ps_size
-        pseudo_weight = ps_large_p_ratio * torch.ones(pseudo_prob.shape,
-                                                      device=dev)
 
-        # update pseudo weight with ratio of pixels exceeding threshold * pseudo_prob
-        pseudo_weight = pseudo_weight * consistency_weight
-
-        # log pseudo weight statistics
         ps_large_p_ratio_dict = {"ps_large_p_ratio": ps_large_p_ratio}
         ps_large_p_ratio_dict = add_prefix(ps_large_p_ratio_dict, 'pseudo')
         log_vars.update(ps_large_p_ratio_dict)
+
+        ps_large_p_ratio_dict = {"ps_large_p_ratio": ps_large_p_ratio}
+        ps_large_p_ratio_dict = add_prefix(ps_large_p_ratio_dict, 'pseudo')
+        log_vars.update(ps_large_p_ratio_dict)
+
+        std, mean = torch.std_mean(pseudo_prob)
+        pseudo_prob_dict = {"pseudo_prob_dict_mean": mean.item(),
+                            "pseudo_prob_dict_std": std.item()}
+        pseudo_prob_dict = add_prefix(pseudo_prob_dict, 'pseudo')
+        log_vars.update(pseudo_prob_dict)
+
+        # update pseudo weight with ratio of pixels exceeding threshold * consistency weight * pseudo_prob
+        pseudo_weight = ps_large_p_ratio * torch.ones(pseudo_prob.shape,
+                                                      device=dev)
+
+        if self.local_iter > 20000:
+            pseudo_weight = pseudo_weight * consistency_weight
+        # pseudo_weight = pseudo_weight * consistency_weight * pseudo_prob
+
+        # save histogram of consistency weights every 1000 iters
+        if self.local_iter % self.debug_img_interval == 0:
+            out_dir = os.path.join(self.train_cfg['work_dir'],
+                                   'consistency_weight_pseudo_prob_debug')
+            os.makedirs(out_dir, exist_ok=True)
+
+            hist_bin = np.arange(0.0, 1.01, 0.01)
+            fig = plt.figure(figsize=(9, 6))
+            consistency_weight_pseudo_prob = consistency_weight * pseudo_prob
+            plt.hist(consistency_weight_pseudo_prob.cpu().flatten().numpy(),
+                     bins=hist_bin, density=True)
+            plt.xlabel('Consistency Weight * Pseudo Prob')
+            plt.ylabel('Probability')
+            plt.title('Histogram')
+            plt.grid(True)
+            fig.savefig(os.path.join(out_dir, f'{(self.local_iter + 1):06d}.png'),
+                        bbox_inches='tight', facecolor='w', edgecolor='w')
+            plt.close(fig)
 
         std, mean = torch.std_mean(pseudo_weight)
         raw_pseudo_weights_dict = {"raw_pseudo_weights_mean": mean.item(),
