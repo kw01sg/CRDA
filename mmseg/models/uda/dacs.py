@@ -1,7 +1,6 @@
 # The ema model and the domain-mixing are based on:
 # https://github.com/vikolss/DACS
 
-import atexit
 import math
 import os
 import random
@@ -10,11 +9,9 @@ from copy import deepcopy
 import mmcv
 import numpy as np
 import torch
-import torch.nn.functional as F
 from matplotlib import pyplot as plt
 from timm.models.layers import DropPath
 from torch.nn.modules.dropout import _DropoutNd
-from zmq import device
 
 from mmseg.core import add_prefix
 from mmseg.models import UDA, build_segmentor
