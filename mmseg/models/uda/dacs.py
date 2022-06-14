@@ -346,6 +346,8 @@ class DACS(UDADecorator):
         # Train on structured consistency loss
         n_pair = 512
         lambda_sc = 1.0
+        log_vars.update(add_prefix({"n_pair": n_pair},
+                                   'structured_consistency'))
 
         # batch_size, n_classes, width, height
         # TODO: integrate in pseudo weight
