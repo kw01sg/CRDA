@@ -44,20 +44,43 @@ def calc_grad_magnitude(grads, norm_type=2.0):
     return norm
 
 
-def calc_consistency_loss(student_softmax, teacher_softmax):
-    # consistency loss from ROCL using cross entropy
-    # have to do it manually as cross entropy loss calculating probabilities
-    # for each class is only supported from torch v1.10 onwards
-    denominator = student_softmax
-    denominator = torch.exp(denominator)
-    denominator = denominator.sum(axis=1, keepdim=True)
+def calc_cross_entropy_loss(t1: torch.Tensor, t2: torch.Tensor, is_mean=False):
+    """
+    Manual calculation of cross entropy loss
 
-    consistency_loss = student_softmax
-    consistency_loss = - torch.log(torch.exp(consistency_loss)
-                                   / denominator) * teacher_softmax
-    consistency_loss = consistency_loss.sum(axis=1).mean()
+    t1 and t2 are expected to contain raw, unnormalized scores for each class
+    in the shape batch_size, n_classes, n_pair
+    """
+    t1_denominator = torch.exp(t1)
+    t1_denominator = t1_denominator.sum(axis=1, keepdim=True)
+    t1_component = torch.log(torch.exp(t1) / t1_denominator)
 
-    return consistency_loss
+    t2_denominator = torch.exp(t2)
+    t2_denominator = t2_denominator.sum(axis=1, keepdim=True)
+    t2_component = torch.log(torch.exp(t2) / t2_denominator)
+
+    cross_entropy_loss = - t1_component * t2_component
+    cross_entropy_loss = cross_entropy_loss.sum(axis=1)
+
+    if is_mean:
+        cross_entropy_loss = cross_entropy_loss.mean()
+
+    return cross_entropy_loss
+
+
+def calc_cross_entropy_pairwise(tensor: torch.Tensor):
+    """
+    Calculates pairwise cross entropy loss using tensor broadcasting
+
+    Given tensor in the shape of batch_size, n_classes, n_pair,
+    returns a matrix of batch_size, n_pair, n_pair where
+    a_ij is cross entropy loss between element a_i and a_j of tensor
+    """
+    tensor_1 = torch.unsqueeze(tensor, -1)
+    tensor_2 = torch.unsqueeze(tensor, -2)
+
+    results = calc_cross_entropy_loss(tensor_1, tensor_2)
+    return results
 
 
 def cosine_pairwise(x):
@@ -345,7 +368,7 @@ class DACS(UDADecorator):
 
         # Train on structured consistency loss
         n_pair = 512
-        lambda_sc = 1.0
+        lambda_sc = 1.0 * 10E-1
         log_vars.update(add_prefix({"n_pair": n_pair},
                                    'structured_consistency'))
 
@@ -355,18 +378,20 @@ class DACS(UDADecorator):
         ema_logits = self.get_ema_model().encode_decode(mixed_img, mixed_img)
 
         # flatten
+        # batch_size, n_classes, width*height
         student_logits = torch.flatten(student_logits, start_dim=2)
         ema_logits = torch.flatten(ema_logits, start_dim=2)
 
         # selecting n_pair random pixels
+        # batch_size, n_classes, n_pair
         selected_index = torch.randperm(student_logits.size()[-1])[:n_pair]
 
         student_logits = student_logits[:, :, selected_index]
         ema_logits = ema_logits[:, :, selected_index]
 
-        # compute cosine similarity
-        student_pairwise = cosine_pairwise(student_logits)
-        ema_pairwise = cosine_pairwise(ema_logits)
+        # compute interpixel similarity
+        student_pairwise = calc_cross_entropy_pairwise(student_logits)
+        ema_pairwise = calc_cross_entropy_pairwise(ema_logits)
 
         mse_loss = MSELoss()
         structured_consistency_loss = lambda_sc * mse_loss(student_pairwise,
