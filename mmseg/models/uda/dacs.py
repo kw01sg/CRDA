@@ -53,13 +53,13 @@ def calc_cross_entropy_loss(t1: torch.Tensor, t2: torch.Tensor, is_mean=False):
     """
     t1_denominator = torch.exp(t1)
     t1_denominator = t1_denominator.sum(axis=1, keepdim=True)
-    t1_component = torch.log(torch.exp(t1) / t1_denominator)
+    t1_softmax = torch.exp(t1) / t1_denominator
 
     t2_denominator = torch.exp(t2)
     t2_denominator = t2_denominator.sum(axis=1, keepdim=True)
-    t2_component = torch.log(torch.exp(t2) / t2_denominator)
+    t2_softmax = torch.exp(t2) / t2_denominator
 
-    cross_entropy_loss = - t1_component * t2_component
+    cross_entropy_loss = - torch.log(t1_softmax) * t2_softmax
     cross_entropy_loss = cross_entropy_loss.sum(axis=1)
 
     if is_mean:
@@ -368,7 +368,7 @@ class DACS(UDADecorator):
 
         # Train on structured consistency loss
         n_pair = 512
-        lambda_sc = 1.0 * 10E-1
+        lambda_sc = 2.5 * 10E-3
         log_vars.update(add_prefix({"n_pair": n_pair},
                                    'structured_consistency'))
 
