@@ -83,6 +83,36 @@ def calc_cross_entropy_pairwise(tensor: torch.Tensor):
     return results
 
 
+def calc_kl_divergence_pairwise(tensor: torch.Tensor):
+    """
+    Calculates pairwise kl divergence loss using tensor broadcasting,
+    following Pytorch implementation
+    https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
+
+    Given tensor in the shape of batch_size, n_classes, n_pair,
+    returns a matrix of batch_size, n_pair, n_pair where
+    a_ij is kl divergence loss between element a_i and a_j of tensor
+
+    tensor is expected to contain raw, unnormalized scores for each class
+    in the shape batch_size, n_classes, n_pair
+    """
+    t1 = torch.unsqueeze(tensor, -1)
+    t2 = torch.unsqueeze(tensor, -2)
+
+    t1_denominator = torch.exp(t1)
+    t1_denominator = t1_denominator.sum(axis=1, keepdim=True)
+    t1_softmax = torch.exp(t1) / t1_denominator
+
+    t2_denominator = torch.exp(t2)
+    t2_denominator = t2_denominator.sum(axis=1, keepdim=True)
+    t2_softmax = torch.exp(t2) / t2_denominator
+
+    kl_divergence_loss = t2_softmax * (t2_softmax.log() - t1_softmax.log())
+    kl_divergence_loss = kl_divergence_loss.sum(axis=1)
+
+    return kl_divergence_loss
+
+
 def cosine_pairwise(x):
     # https://github.com/pytorch/pytorch/issues/11202#issuecomment-619532801
     # convert to batch_size, num_vectors, vector_dimension
@@ -368,7 +398,7 @@ class DACS(UDADecorator):
 
         # Train on structured consistency loss
         n_pair = 512
-        lambda_sc = 2.5 * 10E-3
+        lambda_sc = 0.8 * 10E-3
         log_vars.update(add_prefix({"n_pair": n_pair},
                                    'structured_consistency'))
 
@@ -390,8 +420,8 @@ class DACS(UDADecorator):
         ema_logits = ema_logits[:, :, selected_index]
 
         # compute interpixel similarity
-        student_pairwise = calc_cross_entropy_pairwise(student_logits)
-        ema_pairwise = calc_cross_entropy_pairwise(ema_logits)
+        student_pairwise = calc_kl_divergence_pairwise(student_logits)
+        ema_pairwise = calc_kl_divergence_pairwise(ema_logits)
 
         mse_loss = MSELoss()
         structured_consistency_loss = lambda_sc * mse_loss(student_pairwise,
