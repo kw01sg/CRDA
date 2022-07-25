@@ -5,6 +5,7 @@ import math
 import os
 import random
 from copy import deepcopy
+import json
 
 import mmcv
 import numpy as np
@@ -344,7 +345,7 @@ class DACS(UDADecorator):
         mix_loss.backward()
 
         # Train on structured consistency loss
-        n_pair = 512
+        n_pair = 4
         lambda_sc = 1.0
         log_vars.update(add_prefix({"n_pair": n_pair},
                                    'structured_consistency'))
@@ -360,6 +361,15 @@ class DACS(UDADecorator):
 
         # selecting n_pair random pixels
         selected_index = torch.randperm(student_logits.size()[-1])[:n_pair]
+
+        # write selected index to selected_index_debug JSON file
+        selected_index_log_file = os.path.join(self.train_cfg['work_dir'],
+                                               'selected_index_debug.txt')
+
+        with open(selected_index_log_file, 'a') as f:
+            selected_index_log = ",".join([str(i.item())
+                                           for i in selected_index])
+            f.write(f"{self.local_iter} : {selected_index_log}\n")
 
         student_logits = student_logits[:, :, selected_index]
         ema_logits = ema_logits[:, :, selected_index]
