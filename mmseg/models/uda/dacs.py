@@ -12,6 +12,8 @@ import torch
 from matplotlib import pyplot as plt
 from timm.models.layers import DropPath
 from torch.nn.modules.dropout import _DropoutNd
+import torch.nn.functional as F
+from torch.nn import MSELoss
 
 from mmseg.core import add_prefix
 from mmseg.models import UDA, build_segmentor
@@ -40,6 +42,43 @@ def calc_grad_magnitude(grads, norm_type=2.0):
             torch.stack([torch.norm(p, norm_type) for p in grads]), norm_type)
 
     return norm
+
+
+def calc_consistency_loss(student_softmax, teacher_softmax):
+    # consistency loss from ROCL using cross entropy
+    # have to do it manually as cross entropy loss calculating probabilities
+    # for each class is only supported from torch v1.10 onwards
+    denominator = student_softmax
+    denominator = torch.exp(denominator)
+    denominator = denominator.sum(axis=1, keepdim=True)
+
+    consistency_loss = student_softmax
+    consistency_loss = - torch.log(torch.exp(consistency_loss)
+                                   / denominator) * teacher_softmax
+    consistency_loss = consistency_loss.sum(axis=1).mean()
+
+    return consistency_loss
+
+
+def cosine_pairwise(x):
+    # https://github.com/pytorch/pytorch/issues/11202#issuecomment-619532801
+    # convert to batch_size, num_vectors, vector_dimension
+    # from batch_size, vector_dimension, num_vectors
+    x = x.permute((0, 2, 1))
+
+    x = x.permute((1, 2, 0))
+    cos_sim_pairwise = F.cosine_similarity(x, x.unsqueeze(1), dim=-2)
+    cos_sim_pairwise = cos_sim_pairwise.permute((2, 0, 1))
+    return cos_sim_pairwise
+
+
+def consistency_loss_to_weights(consistency_loss, dev):
+    consistency_weight = consistency_loss.clone().detach().cpu()
+    consistency_weight.apply_(lambda x: 1/np.exp(abs(x)))
+    consistency_weight = consistency_weight.to(device=dev)
+    consistency_weight = consistency_weight * torch.ones_like(consistency_weight,
+                                                              device=dev)
+    return consistency_weight
 
 
 @UDA.register_module()
@@ -253,29 +292,22 @@ class DACS(UDADecorator):
                 grad_mag = calc_grad_magnitude(fd_grads)
                 mmcv.print_log(f'Fdist Grad.: {grad_mag}', 'mmseg')
 
-        # Generate pseudo-label
-        for m in self.get_ema_model().modules():
-            if isinstance(m, _DropoutNd):
-                m.training = False
-            if isinstance(m, DropPath):
-                m.training = False
         ema_logits = self.get_ema_model().encode_decode(
             target_img, target_img_metas)
-
         ema_softmax = torch.softmax(ema_logits.detach(), dim=1)
+
+        # calculate ps_large_p
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
         ps_large_p = pseudo_prob.ge(self.pseudo_threshold).long() == 1
         ps_size = np.size(np.array(pseudo_label.cpu()))
         pseudo_weight = torch.sum(ps_large_p).item() / ps_size
-        pseudo_weight = pseudo_weight * torch.ones(
-            pseudo_prob.shape, device=dev)
 
-        # calculate mean and std dev of psuedo weights before processing
-        std, mean = torch.std_mean(pseudo_weight)
-        raw_pseudo_weights_dict = {"raw_pseudo_weights_std": std.item(),
-                                   "raw_pseudo_weights_mean": mean.item()}
-        raw_pseudo_weights_dict = add_prefix(raw_pseudo_weights_dict, 'pseudo')
-        log_vars.update(raw_pseudo_weights_dict)
+        pseudo_weight_dict = {"pseudo_weight": pseudo_weight}
+        pseudo_weight_dict = add_prefix(pseudo_weight_dict, 'pseudo')
+        log_vars.update(pseudo_weight_dict)
+
+        pseudo_weight = pseudo_weight * torch.ones(pseudo_prob.shape,
+                                                   device=dev)
 
         if self.psweight_ignore_top > 0:
             # Don't trust pseudo-labels in regions with potential
@@ -302,18 +334,6 @@ class DACS(UDADecorator):
         mixed_img = torch.cat(mixed_img)
         mixed_lbl = torch.cat(mixed_lbl)
 
-        # calculate mean and std dev of psuedo weights after mixing
-        # remove zeroes (from ignore_top and ignore_bottom) and ones (from mixing)
-        processed_pseudo_weights = pseudo_weight.clone().flatten()
-        processed_pseudo_weights = processed_pseudo_weights[(processed_pseudo_weights != 0)
-                                                            & (processed_pseudo_weights != 1)]
-        std, mean = torch.std_mean(processed_pseudo_weights)
-        processed_pseudo_weights_dict = {"processed_pseudo_weights_std": std.item(),
-                                         "processed_pseudo_weights_mean": mean.item()}
-        processed_pseudo_weights_dict = add_prefix(processed_pseudo_weights_dict,
-                                                   'pseudo')
-        log_vars.update(processed_pseudo_weights_dict)
-
         # Train on mixed images
         mix_losses = self.get_model().forward_train(
             mixed_img, img_metas, mixed_lbl, pseudo_weight, return_feat=True)
@@ -322,6 +342,42 @@ class DACS(UDADecorator):
         mix_loss, mix_log_vars = self._parse_losses(mix_losses)
         log_vars.update(mix_log_vars)
         mix_loss.backward()
+
+        # Train on structured consistency loss
+        n_pair = 512
+        lambda_sc = 1.0
+        log_vars.update(add_prefix({"n_pair": n_pair},
+                                   'structured_consistency'))
+
+        # batch_size, n_classes, width, height
+        # TODO: integrate in pseudo weight
+        student_logits = self.get_model().encode_decode(mixed_img, img_metas)
+        ema_logits = self.get_ema_model().encode_decode(mixed_img, mixed_img)
+
+        # flatten
+        student_logits = torch.flatten(student_logits, start_dim=2)
+        ema_logits = torch.flatten(ema_logits, start_dim=2)
+
+        # selecting n_pair random pixels
+        selected_index = torch.randperm(student_logits.size()[-1])[:n_pair]
+
+        student_logits = student_logits[:, :, selected_index]
+        ema_logits = ema_logits[:, :, selected_index]
+
+        # compute cosine similarity
+        student_pairwise = cosine_pairwise(student_logits)
+        ema_pairwise = cosine_pairwise(ema_logits)
+
+        mse_loss = MSELoss()
+        structured_consistency_loss = lambda_sc * mse_loss(student_pairwise,
+                                                           ema_pairwise)
+        structured_consistency_loss.backward()
+
+        _, structured_consistency_log = self._parse_losses({'structured_loss':
+                                                            structured_consistency_loss})
+        structured_consistency_log.pop('loss', None)
+        log_vars.update(add_prefix(structured_consistency_log,
+                                   'structured_consistency'))
 
         if self.local_iter % self.debug_img_interval == 0:
             out_dir = os.path.join(self.train_cfg['work_dir'],
